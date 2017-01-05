@@ -1249,26 +1249,39 @@ func (s *MemorySeriesStorage) loop() {
 	memoryFingerprints := s.cycleThroughMemoryFingerprints()
 	archivedFingerprints := s.cycleThroughArchivedFingerprints()
 
+	// Checkpoints can happen concurrently with maintenance so even with heavy
+	// checkpointing there will still be sufficient progress on maintenance.
+	checkpointLoopStopped := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-s.loopStopping:
+				checkpointLoopStopped <- struct{}{}
+				return
+			case <-checkpointTimer.C:
+				err := s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker)
+				if err != nil {
+					log.Errorln("Error while checkpointing:", err)
+				} else {
+					dirtySeriesCount = 0
+				}
+				// If a checkpoint takes longer than checkpointInterval, unluckily timed
+				// combination with the Reset(0) call below can lead to a case where a
+				// time is lurking in C leading to repeated checkpointing without break.
+				select {
+				case <-checkpointTimer.C: // Get rid of the lurking time.
+				default:
+				}
+				checkpointTimer.Reset(s.checkpointInterval)
+			}
+		}
+	}()
+
 loop:
 	for {
 		select {
 		case <-s.loopStopping:
 			break loop
-		case <-checkpointTimer.C:
-			err := s.persistence.checkpointSeriesMapAndHeads(s.fpToSeries, s.fpLocker)
-			if err != nil {
-				log.Errorln("Error while checkpointing:", err)
-			} else {
-				dirtySeriesCount = 0
-			}
-			// If a checkpoint takes longer than checkpointInterval, unluckily timed
-			// combination with the Reset(0) call below can lead to a case where a
-			// time is lurking in C leading to repeated checkpointing without break.
-			select {
-			case <-checkpointTimer.C: // Get rid of the lurking time.
-			default:
-			}
-			checkpointTimer.Reset(s.checkpointInterval)
 		case fp := <-memoryFingerprints:
 			if s.maintainMemorySeries(fp, model.Now().Add(-s.dropAfter)) {
 				dirtySeriesCount++
@@ -1292,6 +1305,7 @@ loop:
 	}
 	for range archivedFingerprints {
 	}
+	<-checkpointLoopStopped
 }
 
 // maintainMemorySeries maintains a series that is in memory (i.e. not
