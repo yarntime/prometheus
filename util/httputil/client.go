@@ -18,50 +18,58 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"net/http"
-	"net/url"
+	"strings"
 	"time"
 
-	"github.com/prometheus/prometheus/config"
+	"github.com/mwitkow/go-conntrack"
+	config_util "github.com/prometheus/common/config"
 )
 
 // NewClient returns a http.Client using the specified http.RoundTripper.
-func NewClient(rt http.RoundTripper) *http.Client {
+func newClient(rt http.RoundTripper) *http.Client {
 	return &http.Client{Transport: rt}
 }
 
-// NewDeadlineClient returns a new http.Client which will time out long running
-// requests.
-func NewDeadlineClient(timeout time.Duration, proxyURL *url.URL) *http.Client {
-	return NewClient(NewDeadlineRoundTripper(timeout, proxyURL))
-}
-
-// NewDeadlineRoundTripper returns a new http.RoundTripper which will time out
-// long running requests.
-func NewDeadlineRoundTripper(timeout time.Duration, proxyURL *url.URL) http.RoundTripper {
-	return &http.Transport{
-		// Set proxy (if null, then becomes a direct connection)
-		Proxy: http.ProxyURL(proxyURL),
-		// We need to disable keepalive, because we set a deadline on the
-		// underlying connection.
-		DisableKeepAlives: true,
-		Dial: func(netw, addr string) (c net.Conn, err error) {
-			start := time.Now()
-
-			c, err = net.DialTimeout(netw, addr, timeout)
-			if err != nil {
-				return nil, err
-			}
-
-			if err = c.SetDeadline(start.Add(timeout)); err != nil {
-				c.Close()
-				return nil, err
-			}
-
-			return c, nil
-		},
+// NewClientFromConfig returns a new HTTP client configured for the
+// given config.HTTPClientConfig. The name is used as go-conntrack metric label.
+func NewClientFromConfig(cfg config_util.HTTPClientConfig, name string) (*http.Client, error) {
+	tlsConfig, err := NewTLSConfig(cfg.TLSConfig)
+	if err != nil {
+		return nil, err
 	}
+	// The only timeout we care about is the configured scrape timeout.
+	// It is applied on request. So we leave out any timings here.
+	var rt http.RoundTripper = &http.Transport{
+		Proxy:               http.ProxyURL(cfg.ProxyURL.URL),
+		MaxIdleConns:        20000,
+		MaxIdleConnsPerHost: 1000, // see https://github.com/golang/go/issues/13801
+		DisableKeepAlives:   false,
+		TLSClientConfig:     tlsConfig,
+		DisableCompression:  true,
+		// 5 minutes is typically above the maximum sane scrape interval. So we can
+		// use keepalive for all configurations.
+		IdleConnTimeout: 5 * time.Minute,
+		DialContext: conntrack.NewDialContextFunc(
+			conntrack.DialWithTracing(),
+			conntrack.DialWithName(name),
+		),
+	}
+
+	// If a bearer token is provided, create a round tripper that will set the
+	// Authorization header correctly on each request.
+	if len(cfg.BearerToken) > 0 {
+		rt = NewBearerAuthRoundTripper(string(cfg.BearerToken), rt)
+	} else if len(cfg.BearerTokenFile) > 0 {
+		rt = NewBearerAuthFileRoundTripper(cfg.BearerTokenFile, rt)
+	}
+
+	if cfg.BasicAuth != nil {
+		rt = NewBasicAuthRoundTripper(cfg.BasicAuth.Username, string(cfg.BasicAuth.Password), rt)
+	}
+
+	// Return a new client with the configured round tripper.
+	return newClient(rt), nil
 }
 
 type bearerAuthRoundTripper struct {
@@ -79,6 +87,32 @@ func (rt *bearerAuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, 
 	if len(req.Header.Get("Authorization")) == 0 {
 		req = cloneRequest(req)
 		req.Header.Set("Authorization", "Bearer "+rt.bearerToken)
+	}
+
+	return rt.rt.RoundTrip(req)
+}
+
+type bearerAuthFileRoundTripper struct {
+	bearerFile string
+	rt         http.RoundTripper
+}
+
+// NewBearerAuthFileRoundTripper adds the bearer token read from the provided file to a request unless
+// the authorization header has already been set. This file is read for every request.
+func NewBearerAuthFileRoundTripper(bearerFile string, rt http.RoundTripper) http.RoundTripper {
+	return &bearerAuthFileRoundTripper{bearerFile, rt}
+}
+
+func (rt *bearerAuthFileRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if len(req.Header.Get("Authorization")) == 0 {
+		b, err := ioutil.ReadFile(rt.bearerFile)
+		if err != nil {
+			return nil, fmt.Errorf("unable to read bearer token file %s: %s", rt.bearerFile, err)
+		}
+		bearerToken := strings.TrimSpace(string(b))
+
+		req = cloneRequest(req)
+		req.Header.Set("Authorization", "Bearer "+bearerToken)
 	}
 
 	return rt.rt.RoundTrip(req)
@@ -119,7 +153,8 @@ func cloneRequest(r *http.Request) *http.Request {
 	return r2
 }
 
-func NewTLSConfig(cfg config.TLSConfig) (*tls.Config, error) {
+// NewTLSConfig creates a new tls.Config from the given config_util.TLSConfig.
+func NewTLSConfig(cfg config_util.TLSConfig) (*tls.Config, error) {
 	tlsConfig := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
 
 	// If a CA cert is provided then let's read it in so we can validate the

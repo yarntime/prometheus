@@ -17,14 +17,37 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"net/url"
-	"reflect"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/discovery/azure"
+	"github.com/prometheus/prometheus/discovery/consul"
+	"github.com/prometheus/prometheus/discovery/dns"
+	"github.com/prometheus/prometheus/discovery/ec2"
+	"github.com/prometheus/prometheus/discovery/file"
+	"github.com/prometheus/prometheus/discovery/kubernetes"
+	"github.com/prometheus/prometheus/discovery/marathon"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"github.com/prometheus/prometheus/discovery/triton"
+	"github.com/prometheus/prometheus/discovery/zookeeper"
+
+	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	sd_config "github.com/prometheus/prometheus/discovery/config"
+	"github.com/prometheus/prometheus/util/testutil"
 	"gopkg.in/yaml.v2"
 )
+
+func mustParseURL(u string) *config_util.URL {
+	parsed, err := url.Parse(u)
+	if err != nil {
+		panic(err)
+	}
+	return &config_util.URL{URL: parsed}
+}
 
 var expectedConf = &Config{
 	GlobalConfig: GlobalConfig{
@@ -39,21 +62,43 @@ var expectedConf = &Config{
 	},
 
 	RuleFiles: []string{
-		"testdata/first.rules",
-		"/absolute/second.rules",
-		"testdata/my/*.rules",
+		filepath.FromSlash("testdata/first.rules"),
+		filepath.FromSlash("testdata/my/*.rules"),
 	},
 
-	RemoteWriteConfig: RemoteWriteConfig{
-		RemoteTimeout: model.Duration(30 * time.Second),
-		WriteRelabelConfigs: []*RelabelConfig{
-			{
-				SourceLabels: model.LabelNames{"__name__"},
-				Separator:    ";",
-				Regex:        MustNewRegexp("expensive.*"),
-				Replacement:  "$1",
-				Action:       RelabelDrop,
+	RemoteWriteConfigs: []*RemoteWriteConfig{
+		{
+			URL:           mustParseURL("http://remote1/push"),
+			RemoteTimeout: model.Duration(30 * time.Second),
+			WriteRelabelConfigs: []*RelabelConfig{
+				{
+					SourceLabels: model.LabelNames{"__name__"},
+					Separator:    ";",
+					Regex:        MustNewRegexp("expensive.*"),
+					Replacement:  "$1",
+					Action:       RelabelDrop,
+				},
 			},
+			QueueConfig: DefaultQueueConfig,
+		},
+		{
+			URL:           mustParseURL("http://remote2/push"),
+			RemoteTimeout: model.Duration(30 * time.Second),
+			QueueConfig:   DefaultQueueConfig,
+		},
+	},
+
+	RemoteReadConfigs: []*RemoteReadConfig{
+		{
+			URL:           mustParseURL("http://remote1/read"),
+			RemoteTimeout: model.Duration(1 * time.Minute),
+			ReadRecent:    true,
+		},
+		{
+			URL:              mustParseURL("http://remote3/read"),
+			RemoteTimeout:    model.Duration(1 * time.Minute),
+			ReadRecent:       false,
+			RequiredMatchers: model.LabelSet{"job": "special"},
 		},
 	},
 
@@ -68,12 +113,12 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			HTTPClientConfig: HTTPClientConfig{
-				BearerTokenFile: "testdata/valid_token_file",
+			HTTPClientConfig: config_util.HTTPClientConfig{
+				BearerTokenFile: filepath.FromSlash("testdata/valid_token_file"),
 			},
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				StaticConfigs: []*TargetGroup{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				StaticConfigs: []*targetgroup.Group{
 					{
 						Targets: []model.LabelSet{
 							{model.AddressLabel: "localhost:9090"},
@@ -86,13 +131,13 @@ var expectedConf = &Config{
 					},
 				},
 
-				FileSDConfigs: []*FileSDConfig{
+				FileSDConfigs: []*file.SDConfig{
 					{
-						Files:           []string{"foo/*.slow.json", "foo/*.slow.yml", "single/file.yml"},
+						Files:           []string{"testdata/foo/*.slow.json", "testdata/foo/*.slow.yml", "testdata/single/file.yml"},
 						RefreshInterval: model.Duration(10 * time.Minute),
 					},
 					{
-						Files:           []string{"bar/*.yaml"},
+						Files:           []string{"testdata/bar/*.yaml"},
 						RefreshInterval: model.Duration(5 * time.Minute),
 					},
 				},
@@ -129,22 +174,24 @@ var expectedConf = &Config{
 			},
 		},
 		{
+
 			JobName: "service-x",
 
 			ScrapeInterval: model.Duration(50 * time.Second),
 			ScrapeTimeout:  model.Duration(5 * time.Second),
+			SampleLimit:    1000,
 
-			HTTPClientConfig: HTTPClientConfig{
-				BasicAuth: &BasicAuth{
+			HTTPClientConfig: config_util.HTTPClientConfig{
+				BasicAuth: &config_util.BasicAuth{
 					Username: "admin_name",
-					Password: "admin_password",
+					Password: "multiline\nmysecret\ntest",
 				},
 			},
 			MetricsPath: "/my_path",
 			Scheme:      "https",
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				DNSSDConfigs: []*DNSSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				DNSSDConfigs: []*dns.SDConfig{
 					{
 						Names: []string{
 							"first.dns.address.domain.com",
@@ -225,13 +272,20 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				ConsulSDConfigs: []*ConsulSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				ConsulSDConfigs: []*consul.SDConfig{
 					{
 						Server:       "localhost:1234",
+						Token:        "mysecret",
 						Services:     []string{"nginx", "cache", "mysql"},
-						TagSeparator: DefaultConsulSDConfig.TagSeparator,
-						Scheme:       DefaultConsulSDConfig.Scheme,
+						TagSeparator: consul.DefaultSDConfig.TagSeparator,
+						Scheme:       "https",
+						TLSConfig: config_util.TLSConfig{
+							CertFile:           filepath.FromSlash("testdata/valid_cert_file"),
+							KeyFile:            filepath.FromSlash("testdata/valid_key_file"),
+							CAFile:             filepath.FromSlash("testdata/valid_ca_file"),
+							InsecureSkipVerify: false,
+						},
 					},
 				},
 			},
@@ -256,13 +310,13 @@ var expectedConf = &Config{
 			MetricsPath: "/metrics",
 			Scheme:      "http",
 
-			HTTPClientConfig: HTTPClientConfig{
-				TLSConfig: TLSConfig{
-					CertFile: "testdata/valid_cert_file",
-					KeyFile:  "testdata/valid_key_file",
+			HTTPClientConfig: config_util.HTTPClientConfig{
+				TLSConfig: config_util.TLSConfig{
+					CertFile: filepath.FromSlash("testdata/valid_cert_file"),
+					KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 				},
 
-				BearerToken: "avalidtoken",
+				BearerToken: "mysecret",
 			},
 		},
 		{
@@ -274,14 +328,38 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				KubernetesSDConfigs: []*KubernetesSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				KubernetesSDConfigs: []*kubernetes.SDConfig{
 					{
 						APIServer: kubernetesSDHostURL(),
-						Role:      KubernetesRoleEndpoint,
-						BasicAuth: &BasicAuth{
+						Role:      kubernetes.RoleEndpoint,
+						BasicAuth: &config_util.BasicAuth{
 							Username: "myusername",
-							Password: "mypassword",
+							Password: "mysecret",
+						},
+						NamespaceDiscovery: kubernetes.NamespaceDiscovery{},
+					},
+				},
+			},
+		},
+		{
+			JobName: "service-kubernetes-namespaces",
+
+			ScrapeInterval: model.Duration(15 * time.Second),
+			ScrapeTimeout:  DefaultGlobalConfig.ScrapeTimeout,
+
+			MetricsPath: DefaultScrapeConfig.MetricsPath,
+			Scheme:      DefaultScrapeConfig.Scheme,
+
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				KubernetesSDConfigs: []*kubernetes.SDConfig{
+					{
+						APIServer: kubernetesSDHostURL(),
+						Role:      kubernetes.RoleEndpoint,
+						NamespaceDiscovery: kubernetes.NamespaceDiscovery{
+							Names: []string{
+								"default",
+							},
 						},
 					},
 				},
@@ -296,17 +374,17 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				MarathonSDConfigs: []*MarathonSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				MarathonSDConfigs: []*marathon.SDConfig{
 					{
 						Servers: []string{
 							"https://marathon.example.com:443",
 						},
 						Timeout:         model.Duration(30 * time.Second),
 						RefreshInterval: model.Duration(30 * time.Second),
-						TLSConfig: TLSConfig{
-							CertFile: "testdata/valid_cert_file",
-							KeyFile:  "testdata/valid_key_file",
+						TLSConfig: config_util.TLSConfig{
+							CertFile: filepath.FromSlash("testdata/valid_cert_file"),
+							KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 						},
 					},
 				},
@@ -321,12 +399,12 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				EC2SDConfigs: []*EC2SDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				EC2SDConfigs: []*ec2.SDConfig{
 					{
 						Region:          "us-east-1",
 						AccessKey:       "access",
-						SecretKey:       "secret",
+						SecretKey:       "mysecret",
 						Profile:         "profile",
 						RefreshInterval: model.Duration(60 * time.Second),
 						Port:            80,
@@ -343,13 +421,13 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				AzureSDConfigs: []*AzureSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				AzureSDConfigs: []*azure.SDConfig{
 					{
 						SubscriptionID:  "11AAAA11-A11A-111A-A111-1111A1111A11",
 						TenantID:        "BBBB222B-B2B2-2B22-B222-2BB2222BB2B2",
 						ClientID:        "333333CC-3C33-3333-CCC3-33C3CCCCC33C",
-						ClientSecret:    "nAdvAK2oBuVym4IXix",
+						ClientSecret:    "mysecret",
 						RefreshInterval: model.Duration(5 * time.Minute),
 						Port:            9100,
 					},
@@ -365,8 +443,8 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				NerveSDConfigs: []*NerveSDConfig{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				NerveSDConfigs: []*zookeeper.NerveSDConfig{
 					{
 						Servers: []string{"localhost"},
 						Paths:   []string{"/monitoring"},
@@ -384,8 +462,8 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				StaticConfigs: []*TargetGroup{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				StaticConfigs: []*targetgroup.Group{
 					{
 						Targets: []model.LabelSet{
 							{model.AddressLabel: "localhost:9090"},
@@ -403,11 +481,38 @@ var expectedConf = &Config{
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
 
-			ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-				StaticConfigs: []*TargetGroup{
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				StaticConfigs: []*targetgroup.Group{
 					{
 						Targets: []model.LabelSet{
 							{model.AddressLabel: "localhost:9090"},
+						},
+					},
+				},
+			},
+		},
+		{
+			JobName: "service-triton",
+
+			ScrapeInterval: model.Duration(15 * time.Second),
+			ScrapeTimeout:  DefaultGlobalConfig.ScrapeTimeout,
+
+			MetricsPath: DefaultScrapeConfig.MetricsPath,
+			Scheme:      DefaultScrapeConfig.Scheme,
+
+			ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+				TritonSDConfigs: []*triton.SDConfig{
+					{
+
+						Account:         "testAccount",
+						DNSSuffix:       "triton.example.com",
+						Endpoint:        "triton.example.com",
+						Port:            9163,
+						RefreshInterval: model.Duration(60 * time.Second),
+						Version:         1,
+						TLSConfig: config_util.TLSConfig{
+							CertFile: "testdata/valid_cert_file",
+							KeyFile:  "testdata/valid_key_file",
 						},
 					},
 				},
@@ -419,8 +524,8 @@ var expectedConf = &Config{
 			{
 				Scheme:  "https",
 				Timeout: 10 * time.Second,
-				ServiceDiscoveryConfig: ServiceDiscoveryConfig{
-					StaticConfigs: []*TargetGroup{
+				ServiceDiscoveryConfig: sd_config.ServiceDiscoveryConfig{
+					StaticConfigs: []*targetgroup.Group{
 						{
 							Targets: []model.LabelSet{
 								{model.AddressLabel: "1.2.3.4:9093"},
@@ -439,35 +544,40 @@ var expectedConf = &Config{
 func TestLoadConfig(t *testing.T) {
 	// Parse a valid file that sets a global scrape timeout. This tests whether parsing
 	// an overwritten default field in the global config permanently changes the default.
-	if _, err := LoadFile("testdata/global_timeout.good.yml"); err != nil {
-		t.Errorf("Error parsing %s: %s", "testdata/global_timeout.good.yml", err)
-	}
+	_, err := LoadFile("testdata/global_timeout.good.yml")
+	testutil.Ok(t, err)
 
 	c, err := LoadFile("testdata/conf.good.yml")
-	if err != nil {
-		t.Fatalf("Error parsing %s: %s", "testdata/conf.good.yml", err)
-	}
+	testutil.Ok(t, err)
 
-	bgot, err := yaml.Marshal(c)
-	if err != nil {
-		t.Fatalf("%s", err)
-	}
-
-	bexp, err := yaml.Marshal(expectedConf)
-	if err != nil {
-		t.Fatalf("%s", err)
-	}
 	expectedConf.original = c.original
+	testutil.Equals(t, expectedConf, c)
+}
 
-	if !reflect.DeepEqual(c, expectedConf) {
-		t.Fatalf("%s: unexpected config result: \n\n%s\n expected\n\n%s", "testdata/conf.good.yml", bgot, bexp)
-	}
+// YAML marshalling must not reveal authentication credentials.
+func TestElideSecrets(t *testing.T) {
+	c, err := LoadFile("testdata/conf.good.yml")
+	testutil.Ok(t, err)
 
-	// String method must not reveal authentication credentials.
-	s := c.String()
-	if strings.Contains(s, "admin_password") {
-		t.Fatalf("config's String method reveals authentication credentials.")
-	}
+	secretRe := regexp.MustCompile(`\\u003csecret\\u003e|<secret>`)
+
+	config, err := yaml.Marshal(c)
+	testutil.Ok(t, err)
+	yamlConfig := string(config)
+
+	matches := secretRe.FindAllStringIndex(yamlConfig, -1)
+	testutil.Assert(t, len(matches) == 6, "wrong number of secret matches found")
+	testutil.Assert(t, !strings.Contains(yamlConfig, "mysecret"),
+		"yaml marshal reveals authentication credentials.")
+}
+
+func TestLoadConfigRuleFilesAbsolutePath(t *testing.T) {
+	// Parse a valid file that sets a rule files with an absolute path
+	c, err := LoadFile(ruleFilesConfigFile)
+	testutil.Ok(t, err)
+
+	ruleFilesExpectedConf.original = c.original
+	testutil.Equals(t, ruleFilesExpectedConf, c)
 }
 
 var expectedErrors = []struct {
@@ -496,6 +606,39 @@ var expectedErrors = []struct {
 		filename: "modulus_missing.bad.yml",
 		errMsg:   "relabel configuration for hashmod requires non-zero modulus",
 	}, {
+		filename: "labelkeep.bad.yml",
+		errMsg:   "labelkeep action requires only 'regex', and no other fields",
+	}, {
+		filename: "labelkeep2.bad.yml",
+		errMsg:   "labelkeep action requires only 'regex', and no other fields",
+	}, {
+		filename: "labelkeep3.bad.yml",
+		errMsg:   "labelkeep action requires only 'regex', and no other fields",
+	}, {
+		filename: "labelkeep4.bad.yml",
+		errMsg:   "labelkeep action requires only 'regex', and no other fields",
+	}, {
+		filename: "labelkeep5.bad.yml",
+		errMsg:   "labelkeep action requires only 'regex', and no other fields",
+	}, {
+		filename: "labeldrop.bad.yml",
+		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	}, {
+		filename: "labeldrop2.bad.yml",
+		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	}, {
+		filename: "labeldrop3.bad.yml",
+		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	}, {
+		filename: "labeldrop4.bad.yml",
+		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	}, {
+		filename: "labeldrop5.bad.yml",
+		errMsg:   "labeldrop action requires only 'regex', and no other fields",
+	}, {
+		filename: "labelmap.bad.yml",
+		errMsg:   "\"l-$1\" is invalid 'replacement' for labelmap action",
+	}, {
 		filename: "rules.bad.yml",
 		errMsg:   "invalid rule file path",
 	}, {
@@ -514,6 +657,9 @@ var expectedErrors = []struct {
 		filename: "kubernetes_role.bad.yml",
 		errMsg:   "role",
 	}, {
+		filename: "kubernetes_namespace_discovery.bad.yml",
+		errMsg:   "unknown fields in namespaces",
+	}, {
 		filename: "kubernetes_bearertoken_basicauth.bad.yml",
 		errMsg:   "at most one of basic_auth, bearer_token & bearer_token_file must be configured",
 	}, {
@@ -528,57 +674,48 @@ var expectedErrors = []struct {
 	}, {
 		filename: "target_label_hashmod_missing.bad.yml",
 		errMsg:   "relabel configuration for hashmod action requires 'target_label' value",
+	}, {
+		filename: "unknown_global_attr.bad.yml",
+		errMsg:   "unknown fields in global config: nonexistent_field",
+	}, {
+		filename: "remote_read_url_missing.bad.yml",
+		errMsg:   `url for remote_read is empty`,
+	}, {
+		filename: "remote_write_url_missing.bad.yml",
+		errMsg:   `url for remote_write is empty`,
 	},
 }
 
 func TestBadConfigs(t *testing.T) {
 	for _, ee := range expectedErrors {
 		_, err := LoadFile("testdata/" + ee.filename)
-		if err == nil {
-			t.Errorf("Expected error parsing %s but got none", ee.filename)
-			continue
-		}
-		if !strings.Contains(err.Error(), ee.errMsg) {
-			t.Errorf("Expected error for %s to contain %q but got: %s", ee.filename, ee.errMsg, err)
-		}
+		testutil.NotOk(t, err, "%s", ee.filename)
+		testutil.Assert(t, strings.Contains(err.Error(), ee.errMsg),
+			"Expected error for %s to contain %q but got: %s", ee.filename, ee.errMsg, err)
 	}
 }
 
 func TestBadStaticConfigs(t *testing.T) {
 	content, err := ioutil.ReadFile("testdata/static_config.bad.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var tg TargetGroup
+	testutil.Ok(t, err)
+	var tg targetgroup.Group
 	err = json.Unmarshal(content, &tg)
-	if err == nil {
-		t.Errorf("Expected unmarshal error but got none.")
-	}
+	testutil.NotOk(t, err, "")
 }
 
 func TestEmptyConfig(t *testing.T) {
 	c, err := Load("")
-	if err != nil {
-		t.Fatalf("Unexpected error parsing empty config file: %s", err)
-	}
+	testutil.Ok(t, err)
 	exp := DefaultConfig
-
-	if !reflect.DeepEqual(*c, exp) {
-		t.Fatalf("want %v, got %v", exp, c)
-	}
+	testutil.Equals(t, exp, *c)
 }
 
 func TestEmptyGlobalBlock(t *testing.T) {
 	c, err := Load("global:\n")
-	if err != nil {
-		t.Fatalf("Unexpected error parsing empty config file: %s", err)
-	}
+	testutil.Ok(t, err)
 	exp := DefaultConfig
 	exp.original = "global:\n"
-
-	if !reflect.DeepEqual(*c, exp) {
-		t.Fatalf("want %v, got %v", exp, c)
-	}
+	testutil.Equals(t, exp, *c)
 }
 
 func TestTargetLabelValidity(t *testing.T) {
@@ -603,13 +740,12 @@ func TestTargetLabelValidity(t *testing.T) {
 		{"foo${bar}foo", true},
 	}
 	for _, test := range tests {
-		if relabelTarget.Match([]byte(test.str)) != test.valid {
-			t.Fatalf("Expected %q to be %v", test.str, test.valid)
-		}
+		testutil.Assert(t, relabelTarget.Match([]byte(test.str)) == test.valid,
+			"Expected %q to be %v", test.str, test.valid)
 	}
 }
 
-func kubernetesSDHostURL() URL {
+func kubernetesSDHostURL() config_util.URL {
 	tURL, _ := url.Parse("https://localhost:1234")
-	return URL{URL: tURL}
+	return config_util.URL{URL: tURL}
 }

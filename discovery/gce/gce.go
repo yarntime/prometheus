@@ -14,22 +14,23 @@
 package gce
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"google.golang.org/api/compute/v1"
-
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
-	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	compute "google.golang.org/api/compute/v1"
 
-	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
+	yaml_util "github.com/prometheus/prometheus/util/yaml"
 )
 
 const (
@@ -44,9 +45,6 @@ const (
 	gceLabelInstanceStatus = gceLabel + "instance_status"
 	gceLabelTags           = gceLabel + "tags"
 	gceLabelMetadata       = gceLabel + "metadata_"
-
-	// Constants for instrumentation.
-	namespace = "prometheus"
 )
 
 var (
@@ -60,16 +58,64 @@ var (
 			Name: "prometheus_sd_gce_refresh_duration",
 			Help: "The duration of a GCE-SD refresh in seconds.",
 		})
+	// DefaultSDConfig is the default GCE SD configuration.
+	DefaultSDConfig = SDConfig{
+		Port:            80,
+		TagSeparator:    ",",
+		RefreshInterval: model.Duration(60 * time.Second),
+	}
 )
+
+// SDConfig is the configuration for GCE based service discovery.
+type SDConfig struct {
+	// Project: The Google Cloud Project ID
+	Project string `yaml:"project"`
+
+	// Zone: The zone of the scrape targets.
+	// If you need to configure multiple zones use multiple gce_sd_configs
+	Zone string `yaml:"zone"`
+
+	// Filter: Can be used optionally to filter the instance list by other criteria.
+	// Syntax of this filter string is described here in the filter query parameter section:
+	// https://cloud.google.com/compute/docs/reference/latest/instances/list
+	Filter string `yaml:"filter,omitempty"`
+
+	RefreshInterval model.Duration `yaml:"refresh_interval,omitempty"`
+	Port            int            `yaml:"port"`
+	TagSeparator    string         `yaml:"tag_separator,omitempty"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *SDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultSDConfig
+	type plain SDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if err := yaml_util.CheckOverflow(c.XXX, "gce_sd_config"); err != nil {
+		return err
+	}
+	if c.Project == "" {
+		return fmt.Errorf("GCE SD configuration requires a project")
+	}
+	if c.Zone == "" {
+		return fmt.Errorf("GCE SD configuration requires a zone")
+	}
+	return nil
+}
 
 func init() {
 	prometheus.MustRegister(gceSDRefreshFailuresCount)
 	prometheus.MustRegister(gceSDRefreshDuration)
 }
 
-// GCEDiscovery periodically performs GCE-SD requests. It implements
-// the TargetProvider interface.
-type GCEDiscovery struct {
+// Discovery periodically performs GCE-SD requests. It implements
+// the Discoverer interface.
+type Discovery struct {
 	project      string
 	zone         string
 	filter       string
@@ -79,17 +125,22 @@ type GCEDiscovery struct {
 	interval     time.Duration
 	port         int
 	tagSeparator string
+	logger       log.Logger
 }
 
-// NewGCEDiscovery returns a new GCEDiscovery which periodically refreshes its targets.
-func NewDiscovery(conf *config.GCESDConfig) (*GCEDiscovery, error) {
-	gd := &GCEDiscovery{
+// NewDiscovery returns a new Discovery which periodically refreshes its targets.
+func NewDiscovery(conf SDConfig, logger log.Logger) (*Discovery, error) {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+	gd := &Discovery{
 		project:      conf.Project,
 		zone:         conf.Zone,
 		filter:       conf.Filter,
 		interval:     time.Duration(conf.RefreshInterval),
 		port:         conf.Port,
 		tagSeparator: conf.TagSeparator,
+		logger:       logger,
 	}
 	var err error
 	gd.client, err = google.DefaultClient(oauth2.NoContext, compute.ComputeReadonlyScope)
@@ -104,32 +155,32 @@ func NewDiscovery(conf *config.GCESDConfig) (*GCEDiscovery, error) {
 	return gd, nil
 }
 
-// Run implements the TargetProvider interface.
-func (gd *GCEDiscovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
+// Run implements the Discoverer interface.
+func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	// Get an initial set right away.
-	tg, err := gd.refresh()
+	tg, err := d.refresh()
 	if err != nil {
-		log.Error(err)
+		level.Error(d.logger).Log("msg", "Refresh failed", "err", err)
 	} else {
 		select {
-		case ch <- []*config.TargetGroup{tg}:
+		case ch <- []*targetgroup.Group{tg}:
 		case <-ctx.Done():
 		}
 	}
 
-	ticker := time.NewTicker(gd.interval)
+	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			tg, err := gd.refresh()
+			tg, err := d.refresh()
 			if err != nil {
-				log.Error(err)
+				level.Error(d.logger).Log("msg", "Refresh failed", "err", err)
 				continue
 			}
 			select {
-			case ch <- []*config.TargetGroup{tg}:
+			case ch <- []*targetgroup.Group{tg}:
 			case <-ctx.Done():
 			}
 		case <-ctx.Done():
@@ -138,7 +189,7 @@ func (gd *GCEDiscovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup
 	}
 }
 
-func (gd *GCEDiscovery) refresh() (tg *config.TargetGroup, err error) {
+func (d *Discovery) refresh() (tg *targetgroup.Group, err error) {
 	t0 := time.Now()
 	defer func() {
 		gceSDRefreshDuration.Observe(time.Since(t0).Seconds())
@@ -147,13 +198,13 @@ func (gd *GCEDiscovery) refresh() (tg *config.TargetGroup, err error) {
 		}
 	}()
 
-	tg = &config.TargetGroup{
-		Source: fmt.Sprintf("GCE_%s_%s", gd.project, gd.zone),
+	tg = &targetgroup.Group{
+		Source: fmt.Sprintf("GCE_%s_%s", d.project, d.zone),
 	}
 
-	ilc := gd.isvc.List(gd.project, gd.zone)
-	if len(gd.filter) > 0 {
-		ilc = ilc.Filter(gd.filter)
+	ilc := d.isvc.List(d.project, d.zone)
+	if len(d.filter) > 0 {
+		ilc = ilc.Filter(d.filter)
 	}
 	err = ilc.Pages(nil, func(l *compute.InstanceList) error {
 		for _, inst := range l.Items {
@@ -161,7 +212,7 @@ func (gd *GCEDiscovery) refresh() (tg *config.TargetGroup, err error) {
 				continue
 			}
 			labels := model.LabelSet{
-				gceLabelProject:        model.LabelValue(gd.project),
+				gceLabelProject:        model.LabelValue(d.project),
 				gceLabelZone:           model.LabelValue(inst.Zone),
 				gceLabelInstanceName:   model.LabelValue(inst.Name),
 				gceLabelInstanceStatus: model.LabelValue(inst.Status),
@@ -170,14 +221,14 @@ func (gd *GCEDiscovery) refresh() (tg *config.TargetGroup, err error) {
 			labels[gceLabelNetwork] = model.LabelValue(priIface.Network)
 			labels[gceLabelSubnetwork] = model.LabelValue(priIface.Subnetwork)
 			labels[gceLabelPrivateIP] = model.LabelValue(priIface.NetworkIP)
-			addr := fmt.Sprintf("%s:%d", priIface.NetworkIP, gd.port)
+			addr := fmt.Sprintf("%s:%d", priIface.NetworkIP, d.port)
 			labels[model.AddressLabel] = model.LabelValue(addr)
 
 			// Tags in GCE are usually only used for networking rules.
 			if inst.Tags != nil && len(inst.Tags.Items) > 0 {
 				// We surround the separated list with the separator as well. This way regular expressions
 				// in relabeling rules don't have to consider tag positions.
-				tags := gd.tagSeparator + strings.Join(inst.Tags.Items, gd.tagSeparator) + gd.tagSeparator
+				tags := d.tagSeparator + strings.Join(inst.Tags.Items, d.tagSeparator) + d.tagSeparator
 				labels[gceLabelTags] = model.LabelValue(tags)
 			}
 

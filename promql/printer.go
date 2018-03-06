@@ -20,8 +20,7 @@ import (
 	"time"
 
 	"github.com/prometheus/common/model"
-
-	"github.com/prometheus/prometheus/storage/metric"
+	"github.com/prometheus/prometheus/pkg/labels"
 )
 
 // Tree returns a string of the tree structure of the given node.
@@ -135,48 +134,47 @@ func (es Expressions) String() (s string) {
 }
 
 func (node *AggregateExpr) String() string {
-	aggrString := fmt.Sprintf("%s(", node.Op)
+	aggrString := node.Op.String()
+
+	if node.Without {
+		aggrString += fmt.Sprintf(" without(%s) ", strings.Join(node.Grouping, ", "))
+	} else {
+		if len(node.Grouping) > 0 {
+			aggrString += fmt.Sprintf(" by(%s) ", strings.Join(node.Grouping, ", "))
+		}
+	}
+
+	aggrString += "("
 	if node.Op.isAggregatorWithParam() {
 		aggrString += fmt.Sprintf("%s, ", node.Param)
 	}
 	aggrString += fmt.Sprintf("%s)", node.Expr)
-	if len(node.Grouping) > 0 {
-		var format string
-		if node.Without {
-			format = "%s WITHOUT (%s)"
-		} else {
-			format = "%s BY (%s)"
-		}
-		aggrString = fmt.Sprintf(format, aggrString, node.Grouping)
-	}
-	if node.KeepCommonLabels {
-		aggrString += " KEEP_COMMON"
-	}
+
 	return aggrString
 }
 
 func (node *BinaryExpr) String() string {
 	returnBool := ""
 	if node.ReturnBool {
-		returnBool = " BOOL"
+		returnBool = " bool"
 	}
 
 	matching := ""
 	vm := node.VectorMatching
 	if vm != nil && (len(vm.MatchingLabels) > 0 || vm.On) {
 		if vm.On {
-			matching = fmt.Sprintf(" ON(%s)", vm.MatchingLabels)
+			matching = fmt.Sprintf(" on(%s)", strings.Join(vm.MatchingLabels, ", "))
 		} else {
-			matching = fmt.Sprintf(" IGNORING(%s)", vm.MatchingLabels)
+			matching = fmt.Sprintf(" ignoring(%s)", strings.Join(vm.MatchingLabels, ", "))
 		}
 		if vm.Card == CardManyToOne || vm.Card == CardOneToMany {
-			matching += " GROUP_"
+			matching += " group_"
 			if vm.Card == CardManyToOne {
-				matching += "LEFT"
+				matching += "left"
 			} else {
-				matching += "RIGHT"
+				matching += "right"
 			}
-			matching += fmt.Sprintf("(%s)", vm.Include)
+			matching += fmt.Sprintf("(%s)", strings.Join(vm.Include, ", "))
 		}
 	}
 	return fmt.Sprintf("%s %s%s%s %s", node.LHS, node.Op, returnBool, matching, node.RHS)
@@ -193,7 +191,7 @@ func (node *MatrixSelector) String() string {
 	}
 	offset := ""
 	if node.Offset != time.Duration(0) {
-		offset = fmt.Sprintf(" OFFSET %s", model.Duration(node.Offset))
+		offset = fmt.Sprintf(" offset %s", model.Duration(node.Offset))
 	}
 	return fmt.Sprintf("%s[%s]%s", vecSelector.String(), model.Duration(node.Range), offset)
 }
@@ -218,14 +216,14 @@ func (node *VectorSelector) String() string {
 	labelStrings := make([]string, 0, len(node.LabelMatchers)-1)
 	for _, matcher := range node.LabelMatchers {
 		// Only include the __name__ label if its no equality matching.
-		if matcher.Name == model.MetricNameLabel && matcher.Type == metric.Equal {
+		if matcher.Name == labels.MetricName && matcher.Type == labels.MatchEqual {
 			continue
 		}
 		labelStrings = append(labelStrings, matcher.String())
 	}
 	offset := ""
 	if node.Offset != time.Duration(0) {
-		offset = fmt.Sprintf(" OFFSET %s", model.Duration(node.Offset))
+		offset = fmt.Sprintf(" offset %s", model.Duration(node.Offset))
 	}
 
 	if len(labelStrings) == 0 {

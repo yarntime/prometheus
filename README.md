@@ -4,6 +4,7 @@
 [![Docker Repository on Quay](https://quay.io/repository/prometheus/prometheus/status)][quay]
 [![Docker Pulls](https://img.shields.io/docker/pulls/prom/prometheus.svg?maxAge=604800)][hub]
 [![Go Report Card](https://goreportcard.com/badge/github.com/prometheus/prometheus)](https://goreportcard.com/report/github.com/prometheus/prometheus)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/486/badge)](https://bestpractices.coreinfrastructure.org/projects/486)
 
 Visit [prometheus.io](https://prometheus.io) for the full documentation,
 examples and guides.
@@ -26,7 +27,7 @@ Prometheus' main distinguishing features as compared to other monitoring systems
 
 ## Architecture overview
 
-![](https://cdn.rawgit.com/prometheus/prometheus/e761f0d/documentation/images/architecture.svg)
+![](https://cdn.rawgit.com/prometheus/prometheus/c34257d069c630685da35bcef084632ffd5d6209/documentation/images/architecture.svg)
 
 ## Install
 
@@ -47,18 +48,22 @@ Debian packages [are available](https://packages.debian.org/sid/net/prometheus).
 
 Docker images are available on [Quay.io](https://quay.io/repository/prometheus/prometheus).
 
+You can launch a Prometheus container for trying it out with
+
+    $ docker run --name prometheus -d -p 127.0.0.1:9090:9090 quay.io/prometheus/prometheus
+
+Prometheus will now be reachable at http://localhost:9090/.
+
 ### Building from source
 
 To build Prometheus from the source code yourself you need to have a working
-Go environment with [version 1.5 or greater installed](http://golang.org/doc/install).
+Go environment with [version 1.10 or greater installed](http://golang.org/doc/install).
 
 You can directly use the `go` tool to download and install the `prometheus`
-and `promtool` binaries into your `GOPATH`. We use Go 1.5's experimental
-vendoring feature, so you will also need to set the `GO15VENDOREXPERIMENT=1`
-environment variable in this case:
+and `promtool` binaries into your `GOPATH`:
 
-    $ GO15VENDOREXPERIMENT=1 go get github.com/prometheus/prometheus/cmd/...
-    $ prometheus -config.file=your_config.yml
+    $ go get github.com/prometheus/prometheus/cmd/...
+    $ prometheus --config.file=your_config.yml
 
 You can also clone the repository yourself and build using `make`:
 
@@ -67,12 +72,13 @@ You can also clone the repository yourself and build using `make`:
     $ git clone https://github.com/prometheus/prometheus.git
     $ cd prometheus
     $ make build
-    $ ./prometheus -config.file=your_config.yml
+    $ ./prometheus --config.file=your_config.yml
 
 The Makefile provides several targets:
 
   * *build*: build the `prometheus` and `promtool` binaries
   * *test*: run the tests
+  * *test-short*: run the short tests
   * *format*: format the source code
   * *vet*: check the source code for common errors
   * *assets*: rebuild the static assets
@@ -82,7 +88,7 @@ The Makefile provides several targets:
 
   * The source code is periodically indexed: [Prometheus Core](http://godoc.org/github.com/prometheus/prometheus).
   * You will find a Travis CI configuration in `.travis.yml`.
-  * All of the core developers are accessible via the [Prometheus Developers Mailinglist](https://groups.google.com/forum/?fromgroups#!forum/prometheus-developers) and the `#prometheus` channel on `irc.freenode.net`.
+  * See the [Community page](https://prometheus.io/community) for how to reach the Prometheus developers and users on various communication channels.
 
 ## Contributing
 

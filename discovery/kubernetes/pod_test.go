@@ -16,11 +16,12 @@ package kubernetes
 import (
 	"testing"
 
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
-	"k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/tools/cache"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func podStoreKeyFunc(obj interface{}) (string, error) {
@@ -33,36 +34,37 @@ func newFakePodInformer() *fakeInformer {
 
 func makeTestPodDiscovery() (*Pod, *fakeInformer) {
 	i := newFakePodInformer()
-	return NewPod(log.Base(), i), i
+	return NewPod(nil, i), i
 }
 
 func makeMultiPortPod() *v1.Pod {
 	return &v1.Pod{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:        "testpod",
 			Namespace:   "default",
 			Labels:      map[string]string{"testlabel": "testvalue"},
 			Annotations: map[string]string{"testannotation": "testannotationvalue"},
+			UID:         types.UID("abc123"),
 		},
 		Spec: v1.PodSpec{
 			NodeName: "testnode",
 			Containers: []v1.Container{
-				v1.Container{
+				{
 					Name: "testcontainer0",
 					Ports: []v1.ContainerPort{
-						v1.ContainerPort{
+						{
 							Name:          "testport0",
 							Protocol:      v1.ProtocolTCP,
 							ContainerPort: int32(9000),
 						},
-						v1.ContainerPort{
+						{
 							Name:          "testport1",
 							Protocol:      v1.ProtocolUDP,
 							ContainerPort: int32(9001),
 						},
 					},
 				},
-				v1.Container{
+				{
 					Name: "testcontainer1",
 				},
 			},
@@ -71,7 +73,7 @@ func makeMultiPortPod() *v1.Pod {
 			PodIP:  "1.2.3.4",
 			HostIP: "2.3.4.5",
 			Conditions: []v1.PodCondition{
-				v1.PodCondition{
+				{
 					Type:   v1.PodReady,
 					Status: v1.ConditionTrue,
 				},
@@ -82,17 +84,18 @@ func makeMultiPortPod() *v1.Pod {
 
 func makePod() *v1.Pod {
 	return &v1.Pod{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "testpod",
 			Namespace: "default",
+			UID:       types.UID("abc123"),
 		},
 		Spec: v1.PodSpec{
 			NodeName: "testnode",
 			Containers: []v1.Container{
-				v1.Container{
+				{
 					Name: "testcontainer",
 					Ports: []v1.ContainerPort{
-						v1.ContainerPort{
+						{
 							Name:          "testport",
 							Protocol:      v1.ProtocolTCP,
 							ContainerPort: int32(9000),
@@ -105,7 +108,7 @@ func makePod() *v1.Pod {
 			PodIP:  "1.2.3.4",
 			HostIP: "2.3.4.5",
 			Conditions: []v1.PodCondition{
-				v1.PodCondition{
+				{
 					Type:   v1.PodReady,
 					Status: v1.ConditionTrue,
 				},
@@ -120,24 +123,24 @@ func TestPodDiscoveryInitial(t *testing.T) {
 
 	k8sDiscoveryTest{
 		discovery: n,
-		expectedInitial: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedInitial: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer0",
 						"__meta_kubernetes_pod_container_port_name":     "testport0",
 						"__meta_kubernetes_pod_container_port_number":   "9000",
 						"__meta_kubernetes_pod_container_port_protocol": "TCP",
 					},
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9001",
 						"__meta_kubernetes_pod_container_name":          "testcontainer0",
 						"__meta_kubernetes_pod_container_port_name":     "testport1",
 						"__meta_kubernetes_pod_container_port_number":   "9001",
 						"__meta_kubernetes_pod_container_port_protocol": "UDP",
 					},
-					model.LabelSet{
+					{
 						"__address__":                          "1.2.3.4",
 						"__meta_kubernetes_pod_container_name": "testcontainer1",
 					},
@@ -151,6 +154,7 @@ func TestPodDiscoveryInitial(t *testing.T) {
 					"__meta_kubernetes_pod_ip":                        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":                   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":                     "true",
+					"__meta_kubernetes_pod_uid":                       "abc123",
 				},
 				Source: "pod/default/testpod",
 			},
@@ -164,10 +168,10 @@ func TestPodDiscoveryAdd(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Add(makePod()) }() },
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer",
 						"__meta_kubernetes_pod_container_port_name":     "testport",
@@ -182,6 +186,7 @@ func TestPodDiscoveryAdd(t *testing.T) {
 					"__meta_kubernetes_pod_ip":        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":     "true",
+					"__meta_kubernetes_pod_uid":       "abc123",
 				},
 				Source: "pod/default/testpod",
 			},
@@ -196,10 +201,10 @@ func TestPodDiscoveryDelete(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Delete(makePod()) }() },
-		expectedInitial: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedInitial: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer",
 						"__meta_kubernetes_pod_container_port_name":     "testport",
@@ -214,12 +219,13 @@ func TestPodDiscoveryDelete(t *testing.T) {
 					"__meta_kubernetes_pod_ip":        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":     "true",
+					"__meta_kubernetes_pod_uid":       "abc123",
 				},
 				Source: "pod/default/testpod",
 			},
 		},
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Source: "pod/default/testpod",
 			},
 		},
@@ -233,10 +239,10 @@ func TestPodDiscoveryDeleteUnknownCacheState(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Delete(cache.DeletedFinalStateUnknown{Obj: makePod()}) }() },
-		expectedInitial: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedInitial: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer",
 						"__meta_kubernetes_pod_container_port_name":     "testport",
@@ -251,12 +257,13 @@ func TestPodDiscoveryDeleteUnknownCacheState(t *testing.T) {
 					"__meta_kubernetes_pod_ip":        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":     "true",
+					"__meta_kubernetes_pod_uid":       "abc123",
 				},
 				Source: "pod/default/testpod",
 			},
 		},
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Source: "pod/default/testpod",
 			},
 		},
@@ -266,17 +273,18 @@ func TestPodDiscoveryDeleteUnknownCacheState(t *testing.T) {
 func TestPodDiscoveryUpdate(t *testing.T) {
 	n, i := makeTestPodDiscovery()
 	i.GetStore().Add(&v1.Pod{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "testpod",
 			Namespace: "default",
+			UID:       "xyz321",
 		},
 		Spec: v1.PodSpec{
 			NodeName: "testnode",
 			Containers: []v1.Container{
-				v1.Container{
+				{
 					Name: "testcontainer",
 					Ports: []v1.ContainerPort{
-						v1.ContainerPort{
+						{
 							Name:          "testport",
 							Protocol:      v1.ProtocolTCP,
 							ContainerPort: int32(9000),
@@ -294,10 +302,10 @@ func TestPodDiscoveryUpdate(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { i.Update(makePod()) }() },
-		expectedInitial: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedInitial: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer",
 						"__meta_kubernetes_pod_container_port_name":     "testport",
@@ -312,14 +320,15 @@ func TestPodDiscoveryUpdate(t *testing.T) {
 					"__meta_kubernetes_pod_ip":        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":     "unknown",
+					"__meta_kubernetes_pod_uid":       "xyz321",
 				},
 				Source: "pod/default/testpod",
 			},
 		},
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9000",
 						"__meta_kubernetes_pod_container_name":          "testcontainer",
 						"__meta_kubernetes_pod_container_port_name":     "testport",
@@ -334,7 +343,51 @@ func TestPodDiscoveryUpdate(t *testing.T) {
 					"__meta_kubernetes_pod_ip":        "1.2.3.4",
 					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
 					"__meta_kubernetes_pod_ready":     "true",
+					"__meta_kubernetes_pod_uid":       "abc123",
 				},
+				Source: "pod/default/testpod",
+			},
+		},
+	}.Run(t)
+}
+
+func TestPodDiscoveryUpdateEmptyPodIP(t *testing.T) {
+	n, i := makeTestPodDiscovery()
+	initialPod := makePod()
+
+	updatedPod := makePod()
+	updatedPod.Status.PodIP = ""
+
+	i.GetStore().Add(initialPod)
+
+	k8sDiscoveryTest{
+		discovery:  n,
+		afterStart: func() { go func() { i.Update(updatedPod) }() },
+		expectedInitial: []*targetgroup.Group{
+			{
+				Targets: []model.LabelSet{
+					{
+						"__address__":                                   "1.2.3.4:9000",
+						"__meta_kubernetes_pod_container_name":          "testcontainer",
+						"__meta_kubernetes_pod_container_port_name":     "testport",
+						"__meta_kubernetes_pod_container_port_number":   "9000",
+						"__meta_kubernetes_pod_container_port_protocol": "TCP",
+					},
+				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_pod_name":      "testpod",
+					"__meta_kubernetes_namespace":     "default",
+					"__meta_kubernetes_pod_node_name": "testnode",
+					"__meta_kubernetes_pod_ip":        "1.2.3.4",
+					"__meta_kubernetes_pod_host_ip":   "2.3.4.5",
+					"__meta_kubernetes_pod_ready":     "true",
+					"__meta_kubernetes_pod_uid":       "abc123",
+				},
+				Source: "pod/default/testpod",
+			},
+		},
+		expectedRes: []*targetgroup.Group{
+			{
 				Source: "pod/default/testpod",
 			},
 		},

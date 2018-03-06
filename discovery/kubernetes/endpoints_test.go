@@ -16,11 +16,12 @@ package kubernetes
 import (
 	"testing"
 
-	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
-	"k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/tools/cache"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/tools/cache"
 )
 
 func endpointsStoreKeyFunc(obj interface{}) (string, error) {
@@ -35,43 +36,43 @@ func makeTestEndpointsDiscovery() (*Endpoints, *fakeInformer, *fakeInformer, *fa
 	svc := newFakeServiceInformer()
 	eps := newFakeEndpointsInformer()
 	pod := newFakePodInformer()
-	return NewEndpoints(log.Base(), svc, eps, pod), svc, eps, pod
+	return NewEndpoints(nil, svc, eps, pod), svc, eps, pod
 }
 
 func makeEndpoints() *v1.Endpoints {
 	return &v1.Endpoints{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "testendpoints",
 			Namespace: "default",
 		},
 		Subsets: []v1.EndpointSubset{
-			v1.EndpointSubset{
+			{
 				Addresses: []v1.EndpointAddress{
-					v1.EndpointAddress{
+					{
 						IP: "1.2.3.4",
 					},
 				},
 				Ports: []v1.EndpointPort{
-					v1.EndpointPort{
+					{
 						Name:     "testport",
 						Port:     9000,
 						Protocol: v1.ProtocolTCP,
 					},
 				},
 			},
-			v1.EndpointSubset{
+			{
 				Addresses: []v1.EndpointAddress{
-					v1.EndpointAddress{
+					{
 						IP: "2.3.4.5",
 					},
 				},
 				NotReadyAddresses: []v1.EndpointAddress{
-					v1.EndpointAddress{
+					{
 						IP: "2.3.4.5",
 					},
 				},
 				Ports: []v1.EndpointPort{
-					v1.EndpointPort{
+					{
 						Name:     "testport",
 						Port:     9001,
 						Protocol: v1.ProtocolTCP,
@@ -88,22 +89,22 @@ func TestEndpointsDiscoveryInitial(t *testing.T) {
 
 	k8sDiscoveryTest{
 		discovery: n,
-		expectedInitial: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedInitial: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                              "1.2.3.4:9000",
 						"__meta_kubernetes_endpoint_port_name":     "testport",
 						"__meta_kubernetes_endpoint_port_protocol": "TCP",
 						"__meta_kubernetes_endpoint_ready":         "true",
 					},
-					model.LabelSet{
+					{
 						"__address__":                              "2.3.4.5:9001",
 						"__meta_kubernetes_endpoint_port_name":     "testport",
 						"__meta_kubernetes_endpoint_port_protocol": "TCP",
 						"__meta_kubernetes_endpoint_ready":         "true",
 					},
-					model.LabelSet{
+					{
 						"__address__":                              "2.3.4.5:9001",
 						"__meta_kubernetes_endpoint_port_name":     "testport",
 						"__meta_kubernetes_endpoint_port_protocol": "TCP",
@@ -123,27 +124,28 @@ func TestEndpointsDiscoveryInitial(t *testing.T) {
 func TestEndpointsDiscoveryAdd(t *testing.T) {
 	n, _, eps, pods := makeTestEndpointsDiscovery()
 	pods.GetStore().Add(&v1.Pod{
-		ObjectMeta: v1.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "testpod",
 			Namespace: "default",
+			UID:       types.UID("deadbeef"),
 		},
 		Spec: v1.PodSpec{
 			NodeName: "testnode",
 			Containers: []v1.Container{
-				v1.Container{
+				{
 					Name: "c1",
 					Ports: []v1.ContainerPort{
-						v1.ContainerPort{
+						{
 							Name:          "mainport",
 							ContainerPort: 9000,
 							Protocol:      v1.ProtocolTCP,
 						},
 					},
 				},
-				v1.Container{
+				{
 					Name: "c2",
 					Ports: []v1.ContainerPort{
-						v1.ContainerPort{
+						{
 							Name:          "sideport",
 							ContainerPort: 9001,
 							Protocol:      v1.ProtocolTCP,
@@ -164,14 +166,14 @@ func TestEndpointsDiscoveryAdd(t *testing.T) {
 			go func() {
 				eps.Add(
 					&v1.Endpoints{
-						ObjectMeta: v1.ObjectMeta{
+						ObjectMeta: metav1.ObjectMeta{
 							Name:      "testendpoints",
 							Namespace: "default",
 						},
 						Subsets: []v1.EndpointSubset{
-							v1.EndpointSubset{
+							{
 								Addresses: []v1.EndpointAddress{
-									v1.EndpointAddress{
+									{
 										IP: "4.3.2.1",
 										TargetRef: &v1.ObjectReference{
 											Kind:      "Pod",
@@ -181,7 +183,7 @@ func TestEndpointsDiscoveryAdd(t *testing.T) {
 									},
 								},
 								Ports: []v1.EndpointPort{
-									v1.EndpointPort{
+									{
 										Name:     "testport",
 										Port:     9000,
 										Protocol: v1.ProtocolTCP,
@@ -193,10 +195,10 @@ func TestEndpointsDiscoveryAdd(t *testing.T) {
 				)
 			}()
 		},
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                                   "4.3.2.1:9000",
 						"__meta_kubernetes_endpoint_port_name":          "testport",
 						"__meta_kubernetes_endpoint_port_protocol":      "TCP",
@@ -210,8 +212,9 @@ func TestEndpointsDiscoveryAdd(t *testing.T) {
 						"__meta_kubernetes_pod_container_port_name":     "mainport",
 						"__meta_kubernetes_pod_container_port_number":   "9000",
 						"__meta_kubernetes_pod_container_port_protocol": "TCP",
+						"__meta_kubernetes_pod_uid":                     "deadbeef",
 					},
-					model.LabelSet{
+					{
 						"__address__":                                   "1.2.3.4:9001",
 						"__meta_kubernetes_pod_name":                    "testpod",
 						"__meta_kubernetes_pod_ip":                      "1.2.3.4",
@@ -222,6 +225,7 @@ func TestEndpointsDiscoveryAdd(t *testing.T) {
 						"__meta_kubernetes_pod_container_port_name":     "sideport",
 						"__meta_kubernetes_pod_container_port_number":   "9001",
 						"__meta_kubernetes_pod_container_port_protocol": "TCP",
+						"__meta_kubernetes_pod_uid":                     "deadbeef",
 					},
 				},
 				Labels: model.LabelSet{
@@ -241,8 +245,8 @@ func TestEndpointsDiscoveryDelete(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { eps.Delete(makeEndpoints()) }() },
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Source: "endpoints/default/testendpoints",
 			},
 		},
@@ -256,8 +260,8 @@ func TestEndpointsDiscoveryDeleteUnknownCacheState(t *testing.T) {
 	k8sDiscoveryTest{
 		discovery:  n,
 		afterStart: func() { go func() { eps.Delete(cache.DeletedFinalStateUnknown{Obj: makeEndpoints()}) }() },
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Source: "endpoints/default/testendpoints",
 			},
 		},
@@ -273,33 +277,33 @@ func TestEndpointsDiscoveryUpdate(t *testing.T) {
 		afterStart: func() {
 			go func() {
 				eps.Update(&v1.Endpoints{
-					ObjectMeta: v1.ObjectMeta{
+					ObjectMeta: metav1.ObjectMeta{
 						Name:      "testendpoints",
 						Namespace: "default",
 					},
 					Subsets: []v1.EndpointSubset{
-						v1.EndpointSubset{
+						{
 							Addresses: []v1.EndpointAddress{
-								v1.EndpointAddress{
+								{
 									IP: "1.2.3.4",
 								},
 							},
 							Ports: []v1.EndpointPort{
-								v1.EndpointPort{
+								{
 									Name:     "testport",
 									Port:     9000,
 									Protocol: v1.ProtocolTCP,
 								},
 							},
 						},
-						v1.EndpointSubset{
+						{
 							Addresses: []v1.EndpointAddress{
-								v1.EndpointAddress{
+								{
 									IP: "2.3.4.5",
 								},
 							},
 							Ports: []v1.EndpointPort{
-								v1.EndpointPort{
+								{
 									Name:     "testport",
 									Port:     9001,
 									Protocol: v1.ProtocolTCP,
@@ -310,22 +314,51 @@ func TestEndpointsDiscoveryUpdate(t *testing.T) {
 				})
 			}()
 		},
-		expectedRes: []*config.TargetGroup{
-			&config.TargetGroup{
+		expectedRes: []*targetgroup.Group{
+			{
 				Targets: []model.LabelSet{
-					model.LabelSet{
+					{
 						"__address__":                              "1.2.3.4:9000",
 						"__meta_kubernetes_endpoint_port_name":     "testport",
 						"__meta_kubernetes_endpoint_port_protocol": "TCP",
 						"__meta_kubernetes_endpoint_ready":         "true",
 					},
-					model.LabelSet{
+					{
 						"__address__":                              "2.3.4.5:9001",
 						"__meta_kubernetes_endpoint_port_name":     "testport",
 						"__meta_kubernetes_endpoint_port_protocol": "TCP",
 						"__meta_kubernetes_endpoint_ready":         "true",
 					},
 				},
+				Labels: model.LabelSet{
+					"__meta_kubernetes_namespace":      "default",
+					"__meta_kubernetes_endpoints_name": "testendpoints",
+				},
+				Source: "endpoints/default/testendpoints",
+			},
+		},
+	}.Run(t)
+}
+
+func TestEndpointsDiscoveryEmptySubsets(t *testing.T) {
+	n, _, eps, _ := makeTestEndpointsDiscovery()
+	eps.GetStore().Add(makeEndpoints())
+
+	k8sDiscoveryTest{
+		discovery: n,
+		afterStart: func() {
+			go func() {
+				eps.Update(&v1.Endpoints{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "testendpoints",
+						Namespace: "default",
+					},
+					Subsets: []v1.EndpointSubset{},
+				})
+			}()
+		},
+		expectedRes: []*targetgroup.Group{
+			{
 				Labels: model.LabelSet{
 					"__meta_kubernetes_namespace":      "default",
 					"__meta_kubernetes_endpoints_name": "testendpoints",

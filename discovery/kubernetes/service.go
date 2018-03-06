@@ -14,17 +14,19 @@
 package kubernetes
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strconv"
 
-	"github.com/prometheus/common/log"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/config"
+	apiv1 "k8s.io/client-go/pkg/api/v1"
+	"k8s.io/client-go/tools/cache"
+
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
-	"golang.org/x/net/context"
-	apiv1 "k8s.io/client-go/1.5/pkg/api/v1"
-	"k8s.io/client-go/1.5/tools/cache"
 )
 
 // Service implements discovery of Kubernetes services.
@@ -36,13 +38,16 @@ type Service struct {
 
 // NewService returns a new service discovery.
 func NewService(l log.Logger, inf cache.SharedInformer) *Service {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
 	return &Service{logger: l, informer: inf, store: inf.GetStore()}
 }
 
-// Run implements the TargetProvider interface.
-func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
+// Run implements the Discoverer interface.
+func (s *Service) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	// Send full initial set of pod targets.
-	var initial []*config.TargetGroup
+	var initial []*targetgroup.Group
 	for _, o := range s.store.List() {
 		tg := s.buildService(o.(*apiv1.Service))
 		initial = append(initial, tg)
@@ -54,10 +59,10 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 	}
 
 	// Send target groups for service updates.
-	send := func(tg *config.TargetGroup) {
+	send := func(tg *targetgroup.Group) {
 		select {
 		case <-ctx.Done():
-		case ch <- []*config.TargetGroup{tg}:
+		case ch <- []*targetgroup.Group{tg}:
 		}
 	}
 	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -66,7 +71,7 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 
 			svc, err := convertToService(o)
 			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
 				return
 			}
 			send(s.buildService(svc))
@@ -76,17 +81,17 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 
 			svc, err := convertToService(o)
 			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
 				return
 			}
-			send(&config.TargetGroup{Source: serviceSource(svc)})
+			send(&targetgroup.Group{Source: serviceSource(svc)})
 		},
 		UpdateFunc: func(_, o interface{}) {
 			eventCount.WithLabelValues("service", "update").Inc()
 
 			svc, err := convertToService(o)
 			if err != nil {
-				s.logger.With("err", err).Errorln("converting to Service object failed")
+				level.Error(s.logger).Log("msg", "converting to Service object failed", "err", err)
 				return
 			}
 			send(s.buildService(svc))
@@ -98,18 +103,18 @@ func (s *Service) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
 }
 
 func convertToService(o interface{}) (*apiv1.Service, error) {
-	service, isService := o.(*apiv1.Service)
-	if !isService {
-		deletedState, ok := o.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			return nil, fmt.Errorf("Received unexpected object: %v", o)
-		}
-		service, ok = deletedState.Obj.(*apiv1.Service)
-		if !ok {
-			return nil, fmt.Errorf("DeletedFinalStateUnknown contained non-Service object: %v", deletedState.Obj)
-		}
+	service, ok := o.(*apiv1.Service)
+	if ok {
+		return service, nil
 	}
-
+	deletedState, ok := o.(cache.DeletedFinalStateUnknown)
+	if !ok {
+		return nil, fmt.Errorf("Received unexpected object: %v", o)
+	}
+	service, ok = deletedState.Obj.(*apiv1.Service)
+	if !ok {
+		return nil, fmt.Errorf("DeletedFinalStateUnknown contained non-Service object: %v", deletedState.Obj)
+	}
 	return service, nil
 }
 
@@ -129,6 +134,7 @@ func serviceLabels(svc *apiv1.Service) model.LabelSet {
 	ls := make(model.LabelSet, len(svc.Labels)+len(svc.Annotations)+2)
 
 	ls[serviceNameLabel] = lv(svc.Name)
+	ls[namespaceLabel] = lv(svc.Namespace)
 
 	for k, v := range svc.Labels {
 		ln := strutil.SanitizeLabelName(serviceLabelPrefix + k)
@@ -142,12 +148,11 @@ func serviceLabels(svc *apiv1.Service) model.LabelSet {
 	return ls
 }
 
-func (s *Service) buildService(svc *apiv1.Service) *config.TargetGroup {
-	tg := &config.TargetGroup{
+func (s *Service) buildService(svc *apiv1.Service) *targetgroup.Group {
+	tg := &targetgroup.Group{
 		Source: serviceSource(svc),
 	}
 	tg.Labels = serviceLabels(svc)
-	tg.Labels[namespaceLabel] = lv(svc.Namespace)
 
 	for _, port := range svc.Spec.Ports {
 		addr := net.JoinHostPort(svc.Name+"."+svc.Namespace+".svc", strconv.FormatInt(int64(port.Port), 10))

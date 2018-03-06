@@ -14,40 +14,127 @@
 package zookeeper
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/prometheus/common/model"
 	"github.com/samuel/go-zookeeper/zk"
-	"golang.org/x/net/context"
 
-	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/util/treecache"
+	yaml_util "github.com/prometheus/prometheus/util/yaml"
 )
 
-type ZookeeperDiscovery struct {
+var (
+	// DefaultServersetSDConfig is the default Serverset SD configuration.
+	DefaultServersetSDConfig = ServersetSDConfig{
+		Timeout: model.Duration(10 * time.Second),
+	}
+	// DefaultNerveSDConfig is the default Nerve SD configuration.
+	DefaultNerveSDConfig = NerveSDConfig{
+		Timeout: model.Duration(10 * time.Second),
+	}
+)
+
+// ServersetSDConfig is the configuration for Twitter serversets in Zookeeper based discovery.
+type ServersetSDConfig struct {
+	Servers []string       `yaml:"servers"`
+	Paths   []string       `yaml:"paths"`
+	Timeout model.Duration `yaml:"timeout,omitempty"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *ServersetSDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultServersetSDConfig
+	type plain ServersetSDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if err := yaml_util.CheckOverflow(c.XXX, "serverset_sd_config"); err != nil {
+		return err
+	}
+	if len(c.Servers) == 0 {
+		return fmt.Errorf("serverset SD config must contain at least one Zookeeper server")
+	}
+	if len(c.Paths) == 0 {
+		return fmt.Errorf("serverset SD config must contain at least one path")
+	}
+	for _, path := range c.Paths {
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("serverset SD config paths must begin with '/': %s", path)
+		}
+	}
+	return nil
+}
+
+// NerveSDConfig is the configuration for AirBnB's Nerve in Zookeeper based discovery.
+type NerveSDConfig struct {
+	Servers []string       `yaml:"servers"`
+	Paths   []string       `yaml:"paths"`
+	Timeout model.Duration `yaml:"timeout,omitempty"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (c *NerveSDConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultNerveSDConfig
+	type plain NerveSDConfig
+	err := unmarshal((*plain)(c))
+	if err != nil {
+		return err
+	}
+	if err := yaml_util.CheckOverflow(c.XXX, "nerve_sd_config"); err != nil {
+		return err
+	}
+	if len(c.Servers) == 0 {
+		return fmt.Errorf("nerve SD config must contain at least one Zookeeper server")
+	}
+	if len(c.Paths) == 0 {
+		return fmt.Errorf("nerve SD config must contain at least one path")
+	}
+	for _, path := range c.Paths {
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("nerve SD config paths must begin with '/': %s", path)
+		}
+	}
+	return nil
+}
+
+// Discovery implements the Discoverer interface for discovering
+// targets from Zookeeper.
+type Discovery struct {
 	conn *zk.Conn
 
-	sources map[string]*config.TargetGroup
+	sources map[string]*targetgroup.Group
 
 	updates    chan treecache.ZookeeperTreeCacheEvent
 	treeCaches []*treecache.ZookeeperTreeCache
 
-	parse func(data []byte, path string) (model.LabelSet, error)
+	parse  func(data []byte, path string) (model.LabelSet, error)
+	logger log.Logger
 }
 
-// NewNerveDiscovery returns a new NerveDiscovery for the given config.
-func NewNerveDiscovery(conf *config.NerveSDConfig) *ZookeeperDiscovery {
-	return NewDiscovery(conf.Servers, time.Duration(conf.Timeout), conf.Paths, parseNerveMember)
+// NewNerveDiscovery returns a new Discovery for the given Nerve config.
+func NewNerveDiscovery(conf *NerveSDConfig, logger log.Logger) *Discovery {
+	return NewDiscovery(conf.Servers, time.Duration(conf.Timeout), conf.Paths, logger, parseNerveMember)
 }
 
-// NewServersetDiscovery returns a new ServersetDiscovery for the given config.
-func NewServersetDiscovery(conf *config.ServersetSDConfig) *ZookeeperDiscovery {
-	return NewDiscovery(conf.Servers, time.Duration(conf.Timeout), conf.Paths, parseServersetMember)
+// NewServersetDiscovery returns a new Discovery for the given serverset config.
+func NewServersetDiscovery(conf *ServersetSDConfig, logger log.Logger) *Discovery {
+	return NewDiscovery(conf.Servers, time.Duration(conf.Timeout), conf.Paths, logger, parseServersetMember)
 }
 
 // NewDiscovery returns a new discovery along Zookeeper parses with
@@ -56,60 +143,67 @@ func NewDiscovery(
 	srvs []string,
 	timeout time.Duration,
 	paths []string,
+	logger log.Logger,
 	pf func(data []byte, path string) (model.LabelSet, error),
-) *ZookeeperDiscovery {
-	conn, _, err := zk.Connect(srvs, time.Duration(timeout))
-	conn.SetLogger(treecache.ZookeeperLogger{})
+) *Discovery {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+
+	conn, _, err := zk.Connect(srvs, timeout)
+	conn.SetLogger(treecache.NewZookeeperLogger(logger))
 	if err != nil {
 		return nil
 	}
 	updates := make(chan treecache.ZookeeperTreeCacheEvent)
-	sd := &ZookeeperDiscovery{
+	sd := &Discovery{
 		conn:    conn,
 		updates: updates,
-		sources: map[string]*config.TargetGroup{},
+		sources: map[string]*targetgroup.Group{},
 		parse:   pf,
+		logger:  logger,
 	}
 	for _, path := range paths {
-		sd.treeCaches = append(sd.treeCaches, treecache.NewZookeeperTreeCache(conn, path, updates))
+		sd.treeCaches = append(sd.treeCaches, treecache.NewZookeeperTreeCache(conn, path, updates, logger))
 	}
 	return sd
 }
 
-// Run implements the TargetProvider interface.
-func (sd *ZookeeperDiscovery) Run(ctx context.Context, ch chan<- []*config.TargetGroup) {
+// Run implements the Discoverer interface.
+func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	defer func() {
-		for _, tc := range sd.treeCaches {
+		for _, tc := range d.treeCaches {
 			tc.Stop()
 		}
 		// Drain event channel in case the treecache leaks goroutines otherwise.
-		for range sd.updates {
+		for range d.updates {
 		}
-		sd.conn.Close()
+		d.conn.Close()
 	}()
 
 	for {
 		select {
 		case <-ctx.Done():
-		case event := <-sd.updates:
-			tg := &config.TargetGroup{
+			return
+		case event := <-d.updates:
+			tg := &targetgroup.Group{
 				Source: event.Path,
 			}
 			if event.Data != nil {
-				labelSet, err := sd.parse(*event.Data, event.Path)
+				labelSet, err := d.parse(*event.Data, event.Path)
 				if err == nil {
 					tg.Targets = []model.LabelSet{labelSet}
-					sd.sources[event.Path] = tg
+					d.sources[event.Path] = tg
 				} else {
-					delete(sd.sources, event.Path)
+					delete(d.sources, event.Path)
 				}
 			} else {
-				delete(sd.sources, event.Path)
+				delete(d.sources, event.Path)
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case ch <- []*config.TargetGroup{tg}:
+			case ch <- []*targetgroup.Group{tg}:
 			}
 		}
 	}

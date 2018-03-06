@@ -11,9 +11,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-GO           := GO15VENDOREXPERIMENT=1 go
-FIRST_GOPATH := $(firstword $(subst :, ,$(GOPATH)))
+# Ensure GOBIN is not set during build so that promu is installed to the correct path
+unexport GOBIN
+
+GO           ?= go
+GOFMT        ?= $(GO)fmt
+FIRST_GOPATH := $(firstword $(subst :, ,$(shell $(GO) env GOPATH)))
 PROMU        := $(FIRST_GOPATH)/bin/promu
+STATICCHECK  := $(FIRST_GOPATH)/bin/staticcheck
+GOVENDOR     := $(FIRST_GOPATH)/bin/govendor
 pkgs          = $(shell $(GO) list ./... | grep -v /vendor/)
 
 PREFIX                  ?= $(shell pwd)
@@ -25,20 +31,33 @@ ifdef DEBUG
 	bindata_flags = -debug
 endif
 
+STATICCHECK_IGNORE = \
+  github.com/prometheus/prometheus/discovery/kubernetes/kubernetes.go:SA1019 \
+  github.com/prometheus/prometheus/discovery/kubernetes/node.go:SA1019 \
+  github.com/prometheus/prometheus/documentation/examples/remote_storage/remote_storage_adapter/main.go:SA1019 \
+  github.com/prometheus/prometheus/pkg/textparse/lex.l.go:SA4006 \
+  github.com/prometheus/prometheus/pkg/pool/pool.go:SA6002 \
+  github.com/prometheus/prometheus/promql/engine.go:SA6002 \
+  github.com/prometheus/prometheus/web/web.go:SA1019
 
-all: format build test
+all: format staticcheck unused build test
 
 style:
 	@echo ">> checking code style"
-	@! gofmt -d $(shell find . -path ./vendor -prune -o -name '*.go' -print) | grep '^'
+	@! $(GOFMT) -d $(shell find . -path ./vendor -prune -o -name '*.go' -print) | grep '^'
 
 check_license:
 	@echo ">> checking license header"
 	@./scripts/check_license.sh
 
-test:
+# TODO(fabxc): example tests temporarily removed.
+test-short:
 	@echo ">> running short tests"
-	@$(GO) test -short $(pkgs)
+	@$(GO) test -short $(shell $(GO) list ./... | grep -v /vendor/ | grep -v examples)
+
+test:
+	@echo ">> running all tests"
+	@$(GO) test -race $(shell $(GO) list ./... | grep -v /vendor/ | grep -v examples)
 
 format:
 	@echo ">> formatting code"
@@ -47,6 +66,14 @@ format:
 vet:
 	@echo ">> vetting code"
 	@$(GO) vet $(pkgs)
+
+staticcheck: $(STATICCHECK)
+	@echo ">> running staticcheck"
+	@$(STATICCHECK) -ignore "$(STATICCHECK_IGNORE)" $(pkgs)
+
+unused: $(GOVENDOR)
+	@echo ">> running check for unused packages"
+	@$(GOVENDOR) list +unused
 
 build: promu
 	@echo ">> building binaries"
@@ -68,9 +95,12 @@ assets:
 
 promu:
 	@echo ">> fetching promu"
-	@GOOS=$(shell uname -s | tr A-Z a-z) \
-	GOARCH=$(subst x86_64,amd64,$(patsubst i%86,386,$(shell uname -m))) \
-	$(GO) get -u github.com/prometheus/promu
+	@GOOS= GOARCH= $(GO) get -u github.com/prometheus/promu
 
+$(FIRST_GOPATH)/bin/staticcheck:
+	@GOOS= GOARCH= $(GO) get -u honnef.co/go/tools/cmd/staticcheck
 
-.PHONY: all style check_license format build test vet assets tarball docker promu
+$(FIRST_GOPATH)/bin/govendor:
+	@GOOS= GOARCH= $(GO) get -u github.com/kardianos/govendor
+
+.PHONY: all style check_license format build test vet assets tarball docker promu staticcheck $(FIRST_GOPATH)/bin/staticcheck govendor $(FIRST_GOPATH)/bin/govendor
